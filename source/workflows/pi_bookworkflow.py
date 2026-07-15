@@ -53,6 +53,10 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
+# Directory containing the books/Letter<X>/ library layout, i.e. the parent of
+# the Letter<X> folders themselves (not the parent of a "books" folder).
+DEFAULT_BOOKS_PATH = os.environ.get("BOOKS_PATH", "./books")
+
 # Chunking for metadata extraction (front-of-book scan only; character-based, not
 # token-based -- good enough since we only ever look at the first few chunks).
 METADATA_CHUNK_SIZE = 4096 * 4
@@ -712,17 +716,17 @@ def library_filename(title: str, author: str, ext: str) -> str:
     return f"{_sanitize_for_filename(title)} - {_sanitize_for_filename(author)}{ext}"
 
 
-def library_path_for_book(library_dir: str, title: str, author: str, ext: str) -> str:
+def library_path_for_book(books_path: str, title: str, author: str, ext: str) -> str:
     letter = library_letter_for_title(title)
-    return os.path.join(library_dir, "books", f"Letter{letter}", library_filename(title, author, ext))
+    return os.path.join(books_path, f"Letter{letter}", library_filename(title, author, ext))
 
 
-def organize_into_library(book_path: str, metadata: BookMetadata, library_dir: str) -> str:
-    """Move the source book file to its books/Letter<X>/ location if it isn't there
-    already, and return the (possibly new) path. All derived outputs are written
-    next to whatever path this returns."""
+def organize_into_library(book_path: str, metadata: BookMetadata, books_path: str) -> str:
+    """Move the source book file to its Letter<X>/ location under books_path if it
+    isn't there already, and return the (possibly new) path. All derived outputs
+    are written next to whatever path this returns."""
     ext = os.path.splitext(book_path)[1]
-    target_path = library_path_for_book(library_dir, metadata.title, metadata.author, ext)
+    target_path = library_path_for_book(books_path, metadata.title, metadata.author, ext)
 
     if os.path.abspath(target_path) == os.path.abspath(book_path):
         return book_path
@@ -807,7 +811,7 @@ async def run_book_workflow(
     provider: Optional[str] = None,
     force: bool = False,
     organize: bool = True,
-    library_dir: str = ".",
+    books_path: str = DEFAULT_BOOKS_PATH,
 ) -> None:
     if not force and is_complete(book_path):
         print(f"All outputs already exist for {book_path}, skipping. Use --force to regenerate.")
@@ -825,7 +829,7 @@ async def run_book_workflow(
         print(f"  {metadata.title} by {metadata.author} ({metadata.publication_year}, {metadata.genre.value})")
 
         if organize:
-            book_path = organize_into_library(book_path, metadata, library_dir)
+            book_path = organize_into_library(book_path, metadata, books_path)
 
         with open(book_to_md_path(book_path), "w", encoding="utf-8") as file:
             file.write(book_content)
@@ -903,14 +907,15 @@ def main() -> None:
     parser.add_argument("--provider", default=None, help="Provider to pass to pi (e.g. anthropic, openai, google)")
     parser.add_argument("--force", action="store_true", help="Regenerate outputs even if they already exist")
     parser.add_argument(
-        "--library-dir",
-        default=".",
-        help="Root directory containing the books/Letter<X>/ library layout (default: current directory)",
+        "--books-path",
+        default=DEFAULT_BOOKS_PATH,
+        help="Directory containing the Letter<X>/ library layout "
+        "(default: $BOOKS_PATH env var if set, else ./books)",
     )
     parser.add_argument(
         "--no-organize",
         action="store_true",
-        help="Don't file the book into books/Letter<X>/<Title> - <Author>.<ext>; write outputs next to book_path as given",
+        help="Don't file the book into <books-path>/Letter<X>/<Title> - <Author>.<ext>; write outputs next to book_path as given",
     )
     args = parser.parse_args()
 
@@ -923,7 +928,7 @@ def main() -> None:
                 provider=args.provider,
                 force=args.force,
                 organize=not args.no_organize,
-                library_dir=args.library_dir,
+                books_path=args.books_path,
             )
         )
     except Exception as exc:  # noqa: BLE001
