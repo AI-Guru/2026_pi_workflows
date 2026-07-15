@@ -1,0 +1,5 @@
+markitdown
+pydantic
+markdown
+weasyprint
+python-dotenv
