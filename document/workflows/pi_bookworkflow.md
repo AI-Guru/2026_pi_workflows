@@ -35,6 +35,10 @@ For a book filed at `books/LetterL/Love Machines - James Muldoon.epub`, one run 
 
 A run is considered complete when all seven files exist; re-running without `--force` skips already-complete books.
 
+## Logging
+
+Every run writes a fresh log to `.logs/YYYYMMDDHHMM-pi_bookworkflow.log` at the repo root (fixed there regardless of the caller's working directory or `--books-path`). The console only shows INFO-level progress (the same lines this doc's steps describe); the file also gets DEBUG-level detail for every single `pi` call: a `pi call start` line (label, model, provider, timeout, cwd) and a matching `pi call end` line (duration, tokens) on success. A stuck run shows up as a `start` with no matching `end` for a specific label — that plus the timeout/retry warnings (`_retry_step` logs each failed attempt, and a final error if all attempts are exhausted) is what to check first if a run seems to hang or takes far longer than expected.
+
 ## Diagram
 
 ![pi_bookworkflow diagram](pi_bookworkflow_diagram.png)

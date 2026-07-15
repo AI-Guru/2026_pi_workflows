@@ -42,6 +42,7 @@ weasyprint.
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -58,6 +59,38 @@ from markitdown import MarkItDown
 from pydantic import BaseModel, Field
 
 load_dotenv()
+
+# Repo root = two levels up from this file (source/workflows/pi_bookworkflow.py),
+# so .logs/ lands in a fixed place regardless of the caller's cwd.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+LOG_DIR = os.path.join(_REPO_ROOT, ".logs")
+
+logger = logging.getLogger("pi_bookworkflow")
+
+
+def _setup_logging() -> str:
+    """Configure `logger` to write a fresh timestamped log file per run, and echo
+    INFO+ to the console. Returns the log file path."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, f"{datetime.now().strftime('%Y%m%d%H%M')}-pi_bookworkflow.log")
+
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    return log_path
+
 
 # Directory containing the books/Letter<X>/ library layout, i.e. the parent of
 # the Letter<X> folders themselves (not the parent of a "books" folder).
@@ -252,6 +285,7 @@ async def run_pi(
     cmd = _build_pi_command(pi_bin, prompt, model=model, provider=provider, tools=tools, no_tools=no_tools)
 
     call_started_at = time.time()
+    logger.debug(f"pi call start: label={label} model={model} provider={provider} timeout={timeout_seconds}s cwd={cwd}")
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -263,10 +297,15 @@ async def run_pi(
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()
+        logger.warning(f"pi call timed out: label={label} after {timeout_seconds}s")
         raise PiError(f"pi call timed out after {timeout_seconds}s (label={label})")
     duration_seconds = time.time() - call_started_at
 
     if process.returncode != 0:
+        logger.error(
+            f"pi call failed: label={label} exit_code={process.returncode} "
+            f"stderr_tail={stderr.decode(errors='replace')[-500:]!r}"
+        )
         raise PiError(f"pi exited with code {process.returncode}: {stderr.decode(errors='replace')[-2000:]}")
 
     last_assistant_text = ""
@@ -290,7 +329,13 @@ async def run_pi(
                     last_usage = message["usage"]
 
     if not last_assistant_text:
+        logger.error(f"pi call produced no assistant text: label={label} stderr_tail={stderr.decode(errors='replace')[-500:]!r}")
         raise PiError(f"pi produced no assistant text. stderr: {stderr.decode(errors='replace')[-2000:]}")
+
+    logger.debug(
+        f"pi call end: label={label} duration={duration_seconds:.1f}s "
+        f"tokens_in={last_usage.get('input', 0)} tokens_out={last_usage.get('output', 0)}"
+    )
 
     if protocol is not None:
         protocol.record(
@@ -377,6 +422,8 @@ async def _retry_step(coro_fn, *args, attempts: int = STEP_RETRY_ATTEMPTS, **kwa
             return await coro_fn(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001 - deliberately broad, mirrors RetryPolicy
             last_exc = exc
+            logger.warning(f"{coro_fn.__name__} attempt {attempt + 1}/{attempts} failed: {exc}")
+    logger.error(f"{coro_fn.__name__} gave up after {attempts} attempts: {last_exc}")
     raise last_exc
 
 
@@ -809,7 +856,7 @@ def organize_into_library(book_path: str, metadata: BookMetadata, books_path: st
         return book_path
 
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    print(f"Filing book into library: {target_path}")
+    logger.info(f"Filing book into library: {target_path}")
     shutil.move(book_path, target_path)
     return target_path
 
@@ -891,16 +938,19 @@ async def run_book_workflow(
     books_path: str = DEFAULT_BOOKS_PATH,
     pi_timeout_seconds: float = DEFAULT_PI_TIMEOUT_SECONDS,
 ) -> None:
+    log_path = _setup_logging()
+    logger.info(f"Logging to {log_path}")
+
     if not force and is_complete(book_path):
-        print(f"All outputs already exist for {book_path}, skipping. Use --force to regenerate.")
+        logger.info(f"All outputs already exist for {book_path}, skipping. Use --force to regenerate.")
         return
 
     protocol = RunProtocol()
     try:
-        print(f"Loading and converting {book_path} ...")
+        logger.info(f"Loading and converting {book_path} ...")
         book_content = load_book_content(book_path)
 
-        print("Extracting book metadata ...")
+        logger.info("Extracting book metadata ...")
         metadata = await _retry_step(
             extract_metadata,
             book_content,
@@ -910,7 +960,7 @@ async def run_book_workflow(
             protocol=protocol,
             timeout_seconds=pi_timeout_seconds,
         )
-        print(f"  {metadata.title} by {metadata.author} ({metadata.publication_year}, {metadata.genre.value})")
+        logger.info(f"  {metadata.title} by {metadata.author} ({metadata.publication_year}, {metadata.genre.value})")
 
         if organize:
             book_path = organize_into_library(book_path, metadata, books_path)
@@ -920,7 +970,7 @@ async def run_book_workflow(
         with open(book_to_metadata_json_path(book_path), "w", encoding="utf-8") as file:
             file.write(metadata.model_dump_json(indent=4))
 
-        print("Building table of contents ...")
+        logger.info("Building table of contents ...")
         toc = await _retry_step(
             build_toc,
             book_content,
@@ -931,7 +981,7 @@ async def run_book_workflow(
             timeout_seconds=pi_timeout_seconds,
         )
 
-        print(f"Answering {len(QUESTIONS)} questions via textsearch over the book ...")
+        logger.info(f"Answering {len(QUESTIONS)} questions via textsearch over the book ...")
         search_dir = os.path.join(
             os.path.dirname(os.path.abspath(book_path)), f".{os.path.basename(book_to_md_path(book_path))}.search"
         )
@@ -961,7 +1011,7 @@ async def run_book_workflow(
             os.remove(search_book_path)
             os.rmdir(search_dir)
 
-        print("Writing full summary ...")
+        logger.info("Writing full summary ...")
         summary = await _retry_step(
             write_long_summary,
             metadata,
@@ -977,7 +1027,7 @@ async def run_book_workflow(
             file.write(summary)
         write_pdf(summary, book_to_summary_pdf_path(book_path))
 
-        print("Writing short summary ...")
+        logger.info("Writing short summary ...")
         short_summary = await _retry_step(
             write_short_summary,
             metadata,
@@ -1000,7 +1050,7 @@ async def run_book_workflow(
         raise RuntimeError("Workflow finished but not all expected output files were created.")
 
     tokens = protocol_dict["tokens"]
-    print(
+    logger.info(
         f"Done in {protocol_dict['duration_seconds']:.1f}s -- "
         f"{protocol_dict['pi_calls']} pi calls, "
         f"tokens in={tokens['input']} out={tokens['output']} total={tokens['total']}"
@@ -1048,7 +1098,7 @@ def main() -> None:
             )
         )
     except Exception as exc:  # noqa: BLE001
-        print(f"Error: {exc}", file=sys.stderr)
+        logger.error(f"Error: {exc}", exc_info=True)
         sys.exit(1)
 
 

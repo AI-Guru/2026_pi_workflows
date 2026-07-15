@@ -6,3 +6,6 @@ __pycache__/
 # Book library: source books and generated outputs (large binaries, copyrighted
 # content, and per-run artifacts) -- not tool source, not tracked.
 books/
+
+# Per-run log files.
+.logs/
