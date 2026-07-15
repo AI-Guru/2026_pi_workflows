@@ -19,6 +19,12 @@ A weak/free model can occasionally return a near-empty answer for a question und
 concurrent load; answers under MIN_ANSWER_WORDS are retried with a fresh, reinforced
 stateless call (up to MAX_THIN_ANSWER_ATTEMPTS times) rather than accepted as-is.
 
+Every pi call is also capped at DEFAULT_PI_TIMEOUT_SECONDS (--pi-timeout /
+PI_CALL_TIMEOUT_SECONDS): a stalled subprocess (rate limit, network stall, an agent
+looping on tool calls) is killed and raised as a PiError rather than hanging forever,
+which the same retry logic (_retry_step, STEP_RETRY_ATTEMPTS) then retries like any
+other failure.
+
 Every pi subprocess call is timed and its token usage (parsed from the `--mode json`
 event stream) recorded into a RunProtocol, written out as `<book>_protocol.json`
 alongside the other outputs -- runtime and input/output/total token counts, per call
@@ -56,6 +62,13 @@ load_dotenv()
 # Directory containing the books/Letter<X>/ library layout, i.e. the parent of
 # the Letter<X> folders themselves (not the parent of a "books" folder).
 DEFAULT_BOOKS_PATH = os.environ.get("BOOKS_PATH", "./books")
+
+# Per-call wall-clock cap. Without this, a stalled pi subprocess (rate limit,
+# network stall, an agent looping on tool calls without converging) hangs the
+# whole run forever -- nothing ever raises, so even the retry logic never gets
+# a chance to kick in. A timeout turns that into an ordinary PiError, which
+# _retry_step already retries like any other failure.
+DEFAULT_PI_TIMEOUT_SECONDS = float(os.environ.get("PI_CALL_TIMEOUT_SECONDS", "600"))
 
 # Chunking for metadata extraction (front-of-book scan only; character-based, not
 # token-based -- good enough since we only ever look at the first few chunks).
@@ -227,6 +240,7 @@ async def run_pi(
     cwd: Optional[str] = None,
     protocol: Optional[RunProtocol] = None,
     label: str = "pi_call",
+    timeout_seconds: float = DEFAULT_PI_TIMEOUT_SECONDS,
 ) -> str:
     """Run one stateless pi turn and return the final assistant message text.
 
@@ -244,7 +258,12 @@ async def run_pi(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise PiError(f"pi call timed out after {timeout_seconds}s (label={label})")
     duration_seconds = time.time() - call_started_at
 
     if process.returncode != 0:
@@ -308,10 +327,20 @@ async def run_pi_json(
     provider: Optional[str] = None,
     protocol: Optional[RunProtocol] = None,
     label: str = "pi_call_json",
+    timeout_seconds: float = DEFAULT_PI_TIMEOUT_SECONDS,
 ) -> dict:
     """Run a text-only pi turn and parse its reply as JSON, repairing on failure."""
 
-    raw = await run_pi(prompt, pi_bin=pi_bin, model=model, provider=provider, no_tools=True, protocol=protocol, label=label)
+    raw = await run_pi(
+        prompt,
+        pi_bin=pi_bin,
+        model=model,
+        provider=provider,
+        no_tools=True,
+        protocol=protocol,
+        label=label,
+        timeout_seconds=timeout_seconds,
+    )
 
     last_error = None
     for attempt in range(MAX_JSON_REPAIR_ATTEMPTS):
@@ -335,6 +364,7 @@ async def run_pi_json(
                 no_tools=True,
                 protocol=protocol,
                 label=f"{label}_repair_{attempt + 1}",
+                timeout_seconds=timeout_seconds,
             )
 
     raise PiError(f"Could not obtain valid JSON after {MAX_JSON_REPAIR_ATTEMPTS} repair attempts: {last_error}")
@@ -397,7 +427,13 @@ def _chunk_text(text: str, chunk_size: int, overlap_ratio: float) -> List[str]:
 
 
 async def extract_metadata(
-    book_content: str, *, pi_bin: str, model: Optional[str], provider: Optional[str], protocol: RunProtocol
+    book_content: str,
+    *,
+    pi_bin: str,
+    model: Optional[str],
+    provider: Optional[str],
+    protocol: RunProtocol,
+    timeout_seconds: float = DEFAULT_PI_TIMEOUT_SECONDS,
 ) -> BookMetadata:
     chunks = _chunk_text(book_content, METADATA_CHUNK_SIZE, METADATA_CHUNK_OVERLAP_RATIO)
 
@@ -435,7 +471,14 @@ async def extract_metadata(
         prompt = "\n".join(prompt_parts)
 
         result = await run_pi_json(
-            prompt, schema, pi_bin=pi_bin, model=model, provider=provider, protocol=protocol, label=f"metadata_chunk_{index}"
+            prompt,
+            schema,
+            pi_bin=pi_bin,
+            model=model,
+            provider=provider,
+            protocol=protocol,
+            label=f"metadata_chunk_{index}",
+            timeout_seconds=timeout_seconds,
         )
         decision = MetadataDecision.model_validate(result)
         book_metadata = decision.book_metadata
@@ -464,7 +507,13 @@ def _parse_headers(text: str) -> List[str]:
 
 
 async def build_toc(
-    book_content: str, *, pi_bin: str, model: Optional[str], provider: Optional[str], protocol: RunProtocol
+    book_content: str,
+    *,
+    pi_bin: str,
+    model: Optional[str],
+    provider: Optional[str],
+    protocol: RunProtocol,
+    timeout_seconds: float = DEFAULT_PI_TIMEOUT_SECONDS,
 ) -> str:
     outline = _parse_headers(book_content)
     if not outline:
@@ -487,7 +536,16 @@ async def build_toc(
         "Reply with the table of contents only, without additional explanation.",
     ])
 
-    return await run_pi(prompt, pi_bin=pi_bin, model=model, provider=provider, no_tools=True, protocol=protocol, label="toc")
+    return await run_pi(
+        prompt,
+        pi_bin=pi_bin,
+        model=model,
+        provider=provider,
+        no_tools=True,
+        protocol=protocol,
+        label="toc",
+        timeout_seconds=timeout_seconds,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +561,7 @@ async def answer_question(
     model: Optional[str],
     provider: Optional[str],
     protocol: RunProtocol,
+    timeout_seconds: float = DEFAULT_PI_TIMEOUT_SECONDS,
 ) -> Dict[str, str]:
     system_and_task = "\n".join([
         "You are writing an engaging book summary for smart readers who want substance without academic stuffiness.",
@@ -540,6 +599,7 @@ async def answer_question(
         cwd=search_dir,
         protocol=protocol,
         label=f"question_{index}",
+        timeout_seconds=timeout_seconds,
     )
 
     for attempt in range(1, MAX_THIN_ANSWER_ATTEMPTS + 1):
@@ -561,6 +621,7 @@ async def answer_question(
             cwd=search_dir,
             protocol=protocol,
             label=f"question_{index}_thin_retry_{attempt}",
+            timeout_seconds=timeout_seconds,
         )
 
     return {"question": question, "answer": answer}
@@ -579,6 +640,7 @@ async def write_long_summary(
     model: Optional[str],
     provider: Optional[str],
     protocol: RunProtocol,
+    timeout_seconds: float = DEFAULT_PI_TIMEOUT_SECONDS,
 ) -> str:
     prompt_parts = [
         "You are a helpful assistant specialized in creating comprehensive book summaries based on question-answer pairs.",
@@ -623,7 +685,14 @@ async def write_long_summary(
         "Provide the complete summary in markdown format.",
     ]
     return await run_pi(
-        "\n".join(prompt_parts), pi_bin=pi_bin, model=model, provider=provider, no_tools=True, protocol=protocol, label="summary"
+        "\n".join(prompt_parts),
+        pi_bin=pi_bin,
+        model=model,
+        provider=provider,
+        no_tools=True,
+        protocol=protocol,
+        label="summary",
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -635,6 +704,7 @@ async def write_short_summary(
     model: Optional[str],
     provider: Optional[str],
     protocol: RunProtocol,
+    timeout_seconds: float = DEFAULT_PI_TIMEOUT_SECONDS,
 ) -> str:
     prompt = "\n".join([
         "You are a helpful assistant specialized in creating concise book summaries.",
@@ -656,7 +726,14 @@ async def write_short_summary(
         "Provide the complete short summary in markdown format. Answer with only the summary, no explanation.",
     ])
     return await run_pi(
-        prompt, pi_bin=pi_bin, model=model, provider=provider, no_tools=True, protocol=protocol, label="short_summary"
+        prompt,
+        pi_bin=pi_bin,
+        model=model,
+        provider=provider,
+        no_tools=True,
+        protocol=protocol,
+        label="short_summary",
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -812,6 +889,7 @@ async def run_book_workflow(
     force: bool = False,
     organize: bool = True,
     books_path: str = DEFAULT_BOOKS_PATH,
+    pi_timeout_seconds: float = DEFAULT_PI_TIMEOUT_SECONDS,
 ) -> None:
     if not force and is_complete(book_path):
         print(f"All outputs already exist for {book_path}, skipping. Use --force to regenerate.")
@@ -824,7 +902,13 @@ async def run_book_workflow(
 
         print("Extracting book metadata ...")
         metadata = await _retry_step(
-            extract_metadata, book_content, pi_bin=pi_bin, model=model, provider=provider, protocol=protocol
+            extract_metadata,
+            book_content,
+            pi_bin=pi_bin,
+            model=model,
+            provider=provider,
+            protocol=protocol,
+            timeout_seconds=pi_timeout_seconds,
         )
         print(f"  {metadata.title} by {metadata.author} ({metadata.publication_year}, {metadata.genre.value})")
 
@@ -837,7 +921,15 @@ async def run_book_workflow(
             file.write(metadata.model_dump_json(indent=4))
 
         print("Building table of contents ...")
-        toc = await _retry_step(build_toc, book_content, pi_bin=pi_bin, model=model, provider=provider, protocol=protocol)
+        toc = await _retry_step(
+            build_toc,
+            book_content,
+            pi_bin=pi_bin,
+            model=model,
+            provider=provider,
+            protocol=protocol,
+            timeout_seconds=pi_timeout_seconds,
+        )
 
         print(f"Answering {len(QUESTIONS)} questions via textsearch over the book ...")
         search_dir = os.path.join(
@@ -860,6 +952,7 @@ async def run_book_workflow(
                         model=model,
                         provider=provider,
                         protocol=protocol,
+                        timeout_seconds=pi_timeout_seconds,
                     )
                     for index, question in enumerate(QUESTIONS)
                 )
@@ -870,7 +963,15 @@ async def run_book_workflow(
 
         print("Writing full summary ...")
         summary = await _retry_step(
-            write_long_summary, metadata, toc, list(qa_pairs), pi_bin=pi_bin, model=model, provider=provider, protocol=protocol
+            write_long_summary,
+            metadata,
+            toc,
+            list(qa_pairs),
+            pi_bin=pi_bin,
+            model=model,
+            provider=provider,
+            protocol=protocol,
+            timeout_seconds=pi_timeout_seconds,
         )
         with open(book_to_summary_md_path(book_path), "w", encoding="utf-8") as file:
             file.write(summary)
@@ -878,7 +979,14 @@ async def run_book_workflow(
 
         print("Writing short summary ...")
         short_summary = await _retry_step(
-            write_short_summary, metadata, summary, pi_bin=pi_bin, model=model, provider=provider, protocol=protocol
+            write_short_summary,
+            metadata,
+            summary,
+            pi_bin=pi_bin,
+            model=model,
+            provider=provider,
+            protocol=protocol,
+            timeout_seconds=pi_timeout_seconds,
         )
         with open(book_to_shortsummary_md_path(book_path), "w", encoding="utf-8") as file:
             file.write(short_summary)
@@ -917,6 +1025,13 @@ def main() -> None:
         action="store_true",
         help="Don't file the book into <books-path>/Letter<X>/<Title> - <Author>.<ext>; write outputs next to book_path as given",
     )
+    parser.add_argument(
+        "--pi-timeout",
+        type=float,
+        default=DEFAULT_PI_TIMEOUT_SECONDS,
+        help="Per-call timeout in seconds before a pi subprocess is killed and retried "
+        "(default: $PI_CALL_TIMEOUT_SECONDS env var if set, else 600)",
+    )
     args = parser.parse_args()
 
     try:
@@ -929,6 +1044,7 @@ def main() -> None:
                 force=args.force,
                 organize=not args.no_organize,
                 books_path=args.books_path,
+                pi_timeout_seconds=args.pi_timeout,
             )
         )
     except Exception as exc:  # noqa: BLE001

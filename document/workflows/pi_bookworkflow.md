@@ -7,6 +7,7 @@ It re-implements an earlier LangGraph + vector-store book-summary pipeline, with
 - **No LangGraph.** Every step is a stateless call to a fresh `pi --mode json --no-session -p "..."` subprocess, so the whole thing is a plain top-to-bottom `asyncio` pipeline instead of a graph — there's no shared state to thread through a runtime.
 - **No vector store.** Instead of embedding the book into chunks and giving the model a similarity-search tool, one `pi` subprocess per question runs with its working directory set to a scratch folder holding the book's full text, and only the `grep`/`find`/`read` tools enabled. The agent does its own thorough text search over the real file.
 - **No structured-output API.** pi has no schema-constrained output, so the metadata-extraction step asks the model for raw JSON and repairs it with a corrective follow-up call if parsing fails (up to 3 attempts).
+- **No hangs.** Every pi call is capped at `--pi-timeout` seconds (default 600); a stalled subprocess (rate limit, network stall, an agent looping on tool calls) is killed and raised as an error, which the normal step-retry logic then retries like any other failure — instead of the whole run blocking forever.
 
 ## Steps
 
@@ -44,5 +45,6 @@ A scalable version is at [pi_bookworkflow.svg](pi_bookworkflow.svg).
 
 - Only `pi`'s configured provider(s) can be used (`--provider`/`--model` flags pass straight through); check `pi --list-models`.
 - `.env` (loaded automatically) can set `BOOKS_PATH` to point `--books-path` at wherever the real `Letter<X>/` library lives, instead of passing it on every invocation.
+- `.env` can also set `PI_CALL_TIMEOUT_SECONDS` (or use `--pi-timeout`) to change the per-call timeout from its 600s default -- e.g. lower it on a fast/reliable provider, or raise it for a very large book on a slow model.
 - `weasyprint` needs native Pango/GObject libraries. On macOS with Homebrew, the script points `DYLD_LIBRARY_PATH` at `/opt/homebrew/lib` or `/usr/local/lib` automatically if neither is already set.
 - A weak/free model can produce a near-empty answer for an occasional question under concurrent load; answers under `MIN_ANSWER_WORDS` (100) are automatically retried with a fresh, reinforced call (up to `MAX_THIN_ANSWER_ATTEMPTS`, 2). The 12 questions also deliberately overlap, so the long-summary synthesis step stays resilient even if a retry still comes back thin. Check `protocol.json`'s per-call `output_tokens` and `question_*_thin_retry_*` labels if a summary reads thin.
